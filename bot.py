@@ -1,9 +1,15 @@
-import requests
 import csv
-import time
 import re
+import time
 from datetime import datetime
+from typing import Iterable, List
+
+import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from flow_filters import FlowMode
 
 # ---------- COLORS FOR TERMINAL OUTPUT ----------
 RESET   = "\033[0m"
@@ -17,6 +23,9 @@ MAGENTA = "\033[95m"
 # ----------------------------------
 # CONFIG
 # ----------------------------------
+
+# Toggle between sniper mode (new pairs) and Cupsey-style flow mode (trending pairs)
+FLOW_MODE = False  # set True to use Cupsey-style flow mode
 
 # ---------- MARKET / DEX FILTERS ----------
 # Only trade pairs on these AMM DEXes (tweak if you want more)
@@ -34,10 +43,25 @@ MIN_24H_VOL   = 20000     # minimum 24h volume in USD
 
 NEW_PAIRS_URL = "https://dexscreener.com/new-pairs/solana?rankBy=pairAge&order=asc"
 DEX_PAIR_API = "https://api.dexscreener.com/latest/dex/pairs/solana/{}"
+TRENDING_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q=sol"
+DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; sniper-bot/1.0)"}
+HTTP_TIMEOUT = 10
 
 CHECK_INTERVAL_SECONDS = 10      # how often to poll the new-pairs page
 MAX_PAIRS_PER_CYCLE    = 20      # don’t hammer the API too hard
 LOG_FILE               = "meme_signals.csv"
+
+# Honeypot heuristics / guardrails
+MAX_TAX_PCT                = 15
+NO_SELLS_AFTER_SECONDS     = 60
+NO_SELLS_MIN_BUYS          = 10
+EXTREME_BUY_PRESSURE_RATIO = 15
+EXTREME_BUY_PRESSURE_BUYS  = 25
+MIN_SELL_DELTA_WINDOW      = 5 * 60
+MAX_SELL_DELTA             = 2
+STILL_LOW_SELLS_WINDOW     = 10 * 60
+STILL_LOW_SELLS_ALLOWANCE  = 3
+HONEYPOT_FORCE_EXIT_AFTER  = 8 * 60
 
 # ----------------------------------
 # PAPER TRADE CONFIG
@@ -53,6 +77,25 @@ TRADES_LOG_FILE      = "paper_trades.csv"
 # In-memory open trades: pairAddress -> dict
 open_trades = {}
 
+# Global HTTP session with retries so we are polite to the API and resilient to hiccups
+def build_http_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+SESSION = build_http_session()
+FLOW = FlowMode()
+
 
 # ----------------------------------
 # UTILS
@@ -66,6 +109,18 @@ def safe_get(obj, path, default=None):
             return default
         cur = cur[key]
     return cur
+
+
+def compute_pair_age_sec(pair) -> int:
+    """Return the pair age in seconds (non-negative)."""
+    created_ms = safe_get(pair, "pairCreatedAt", None)
+    if created_ms is None:
+        return -1
+    try:
+        now_ms = int(time.time() * 1000)
+        return max(0, int((now_ms - int(created_ms)) / 1000))
+    except (TypeError, ValueError):
+        return -1
 
 
 def colour_for_score(score: int) -> str:
@@ -84,17 +139,13 @@ def colour_for_score(score: int) -> str:
 # FETCH NEWEST PAIRS FROM WEBPAGE
 # ----------------------------------
 
-def fetch_new_pair_addresses(limit=MAX_PAIRS_PER_CYCLE):
+def fetch_new_pair_addresses(limit: int = MAX_PAIRS_PER_CYCLE) -> List[str]:
     """
     Scrape Dexscreener new Solana pairs page and extract newest pair addresses.
     We look for <a href="/solana/<pairAddress>"> links.
     """
     try:
-        resp = requests.get(
-            NEW_PAIRS_URL,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
+        resp = SESSION.get(NEW_PAIRS_URL, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             print("❌ New-pairs page error:", resp.status_code)
             return []
@@ -123,11 +174,31 @@ def fetch_new_pair_addresses(limit=MAX_PAIRS_PER_CYCLE):
         return []
 
 
+def fetch_trending_pairs(limit: int = MAX_PAIRS_PER_CYCLE):
+    """Fetch trending Solana pairs from Dexscreener's search endpoint."""
+    try:
+        resp = SESSION.get(TRENDING_SEARCH_URL, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            print("❌ Trending search error:", resp.status_code)
+            return []
+
+        data = resp.json()
+        pairs = data.get("pairs") or []
+        if not isinstance(pairs, list):
+            return []
+
+        return pairs[:limit]
+
+    except Exception as e:
+        print("❌ Error fetching trending pairs:", e)
+        return []
+
+
 # ----------------------------------
 # FETCH FULL PAIR INFO FROM API
 # ----------------------------------
 
-def fetch_pairs_for_addresses(addresses):
+def fetch_pairs_for_addresses(addresses: Iterable[str]):
     """
     For each pair address, call Dexscreener's pair API and collect pair objects.
     """
@@ -135,7 +206,7 @@ def fetch_pairs_for_addresses(addresses):
     for addr in addresses:
         url = DEX_PAIR_API.format(addr)
         try:
-            resp = requests.get(url, timeout=10)
+            resp = SESSION.get(url, timeout=HTTP_TIMEOUT)
             if resp.status_code != 200:
                 print(f"❌ API {resp.status_code} for pair {addr}")
                 continue
@@ -259,12 +330,9 @@ def compute_score(pair):
         score += 15
 
     # --- Age ---
-    created_ms = safe_get(pair, "pairCreatedAt", None)
-    age_sec = -1
-    if created_ms is not None:
-        now_ms = int(time.time() * 1000)
-        age_sec = int((now_ms - created_ms) / 1000)
+    age_sec = compute_pair_age_sec(pair)
 
+    if age_sec >= 0:
         if 20 <= age_sec <= 150:
             score += 25
         elif 10 <= age_sec <= 240:
@@ -367,6 +435,40 @@ def maybe_open_paper_trade(pair, score, age_sec, tags_str):
 
     print(f"{CYAN}📈 OPEN PAPER TRADE | {symbol} at ${price:.6f}{RESET}")
 
+
+def detect_honeypot(pair, trade, age, sells_5m, buys_5m, sells_24h_now):
+    """Evaluate honeypot-style red flags for an open trade."""
+
+    honeypot_reasons = []
+
+    # Dexscreener occasionally provides explicit flags
+    if safe_get(pair, "info.isHoneypot", False) or safe_get(pair, "info.honeypot", False):
+        honeypot_reasons.append("dexscreener_flag")
+
+    sell_tax = safe_get(pair, "info.sellTax", 0) or 0
+    buy_tax  = safe_get(pair, "info.buyTax", 0) or 0
+
+    if sell_tax >= MAX_TAX_PCT or buy_tax >= MAX_TAX_PCT:
+        honeypot_reasons.append("high_tax")
+
+    ratio_5m = buys_5m / max(1, sells_5m)
+    sells_24h_prev = trade.get("sells_24h_entry", 0)
+    delta_sells_24h = sells_24h_now - sells_24h_prev
+
+    if age > NO_SELLS_AFTER_SECONDS and sells_5m == 0 and buys_5m >= NO_SELLS_MIN_BUYS:
+        honeypot_reasons.append("no_sells_recent")
+
+    if buys_5m >= EXTREME_BUY_PRESSURE_BUYS and ratio_5m >= EXTREME_BUY_PRESSURE_RATIO:
+        honeypot_reasons.append("insane_5m_buy_pressure")
+
+    if age > MIN_SELL_DELTA_WINDOW and delta_sells_24h <= MAX_SELL_DELTA:
+        honeypot_reasons.append("no_new_sells_since_entry")
+
+    if age > STILL_LOW_SELLS_WINDOW and sells_24h_now <= sells_24h_prev + STILL_LOW_SELLS_ALLOWANCE:
+        honeypot_reasons.append("still_no_liquidity_exit")
+
+    return bool(honeypot_reasons), honeypot_reasons
+
 def check_paper_trade_exit(pair):
     """Check if any open paper trade for this pair should be closed."""
     pair_addr = pair.get("pairAddress", "unknown")
@@ -400,41 +502,14 @@ def check_paper_trade_exit(pair):
     buys_5m        = safe_get(pair, "txns.m5.buys", 0) or 0
     sells_5m       = safe_get(pair, "txns.m5.sells", 0) or 0
     sells_24h_now  = safe_get(pair, "txns.h24.sells", 0) or 0
-    sells_24h_prev = trade.get("sells_24h_entry", 0)
-    delta_sells_24h = sells_24h_now - sells_24h_prev
-
-    honeypot_flag = False
-
-    # Tax data (NEW)
-    sell_tax = safe_get(pair, "info.sellTax", 0) or 0
-    buy_tax  = safe_get(pair, "info.buyTax", 0) or 0
-
-    if sell_tax >= 15 or buy_tax >= 15:
-        honeypot_flag = True
-
-    honeypot_reasons = []
-
-    ratio_5m = buys_5m / max(1, sells_5m)
-
-    # A1) 60+ seconds old, basically no sells recently
-    if age > 60 and sells_5m == 0 and buys_5m >= 10:
-        honeypot_flag = True
-        honeypot_reasons.append("no_sells_5m_after_60s")
-
-    # A2) Very skewed buy/sell ratio in 5m window
-    if buys_5m >= 25 and ratio_5m >= 15:
-        honeypot_flag = True
-        honeypot_reasons.append("insane_5m_buy_pressure")
-
-    # A3) Over lifetime: almost no new sells since we entered
-    if age > 5 * 60 and delta_sells_24h <= 2:
-        honeypot_flag = True
-        honeypot_reasons.append("no_new_sells_since_entry")
-
-    # A4) 10+ min in trade, still very few sells overall
-    if age > 10 * 60 and sells_24h_now <= sells_24h_prev + 3:
-        honeypot_flag = True
-        honeypot_reasons.append("still_no_liquidity_exit")
+    honeypot_flag, honeypot_reasons = detect_honeypot(
+        pair,
+        trade,
+        age,
+        sells_5m=sells_5m,
+        buys_5m=buys_5m,
+        sells_24h_now=sells_24h_now,
+    )
 
     # --- If it smells like a honeypot, do NOT allow a TP win ---
     if honeypot_flag and reason == "TP":
@@ -445,7 +520,7 @@ def check_paper_trade_exit(pair):
         current_price = 0.0
 
     # Optional: force close obviously honeypotty trades even without TP/SL/TIME
-    if honeypot_flag and reason is None and age > 8 * 60:
+    if honeypot_flag and reason is None and age > HONEYPOT_FORCE_EXIT_AFTER:
         reason   = "HONEYPOT"
         pnl_usd  = -trade["size_usd"]
         pnl_pct  = -100.0
@@ -575,109 +650,145 @@ def log_paper_trade(row):
             ])
         writer.writerow(row)
 
-# ----------------------------------
-# MAIN LOOP
-# ----------------------------------
+def run_bot() -> None:
+    """Main loop to poll Dexscreener, surface signals, and paper-trade them."""
+    mode_label = "Cupsey-style FLOW mode (trending)" if FLOW_MODE else "New-pairs sniper mode"
+    source_url = TRENDING_SEARCH_URL if FLOW_MODE else NEW_PAIRS_URL
 
-print("🚀 Starting AI-Style Memecoin Scanner (Dexscreener new pairs)…")
-print(f"Source: {NEW_PAIRS_URL}\n")
+    print(f"🚀 Starting AI-Style Memecoin Scanner ({mode_label})…")
+    print(f"Source: {source_url}\n")
 
-seen_pairs = set()  # to avoid alerting the same pair again and again
+    seen_pairs = set()  # to avoid alerting the same pair again and again
 
-while True:
-    # 1) Update all existing paper trades first
-    if open_trades:
-        try:
-            open_addrs = list(open_trades.keys())
-            open_pairs = fetch_pairs_for_addresses(open_addrs)
-            for op in open_pairs:
-                check_paper_trade_exit(op)
-        except Exception as e:
-            print("⚠️ Error updating open trades:", e)
+    while True:
+        # 1) Update all existing paper trades first
+        if open_trades:
+            try:
+                open_addrs = list(open_trades.keys())
+                open_pairs = fetch_pairs_for_addresses(open_addrs)
+                for op in open_pairs:
+                    check_paper_trade_exit(op)
+            except Exception as e:
+                print("⚠️ Error updating open trades:", e)
 
-    # 2) Fetch newest pairs from Dexscreener
-    addrs = fetch_new_pair_addresses()
-    if not addrs:
-        print("⚠️ No addresses scraped this cycle.")
+        # 2) Choose discovery path based on mode
+        if FLOW_MODE:
+            raw_pairs = fetch_trending_pairs()
+            if not raw_pairs:
+                print("⚠️ No trending pairs fetched this cycle.")
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
+
+            pairs = []
+            for p in raw_pairs:
+                addr = p.get("pairAddress")
+                if not addr or addr in seen_pairs:
+                    continue
+                seen_pairs.add(addr)
+                pairs.append(p)
+
+            if not pairs:
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
+        else:
+            addrs = fetch_new_pair_addresses()
+            if not addrs:
+                print("⚠️ No addresses scraped this cycle.")
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
+
+            # Skip already-seen pairs so we only alert once per pair
+            new_addrs = [a for a in addrs if a not in seen_pairs]
+            for a in new_addrs:
+                seen_pairs.add(a)
+
+            if not new_addrs:
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
+
+            # Fetch full pair data for those new addresses
+            pairs = fetch_pairs_for_addresses(new_addrs)
+
+        # 3) Process each pair
+        for p in pairs:
+            try:
+                # Skip obviously untradable stuff first
+                if not is_probably_tradable_on_axiom(p):
+                    continue
+
+                # Structural + behavioural filters
+                if FLOW_MODE:
+                    if not FLOW.is_valid_flow(p):
+                        continue
+                    score = FLOW.compute_flow_score(p)
+                    age_sec = compute_pair_age_sec(p)
+                    liq = safe_get(p, "liquidity.usd", 0) or 0
+                    buys_5m = safe_get(p, "txns.m5.buys", 0) or 0
+                    sells_5m = safe_get(p, "txns.m5.sells", 0) or 0
+                else:
+                    if not is_valid_signal(p):
+                        continue
+                    score, age_sec, liq, buys_5m, sells_5m = compute_score(p)
+
+                # Allow only good setups (tune 55/60 as you like)
+                min_score = 60 if FLOW_MODE else 55
+                if score < min_score:
+                    continue
+
+                # Smart-money style tags
+                tags, buys_24h, sells_24h, vol24, avg_trade = compute_tags(
+                    p, age_sec, liq, buys_5m, sells_5m
+                )
+                tags_str = ", ".join(tags) if tags else ""
+
+                base      = p.get("baseToken", {}) or {}
+                symbol    = base.get("symbol", "UNKNOWN")
+                name      = base.get("name", "")
+                pair_addr = p.get("pairAddress", "unknown")
+                axiom_url = build_axiom_url(p)
+                col       = colour_for_score(score)
+                label     = "FLOW SIGNAL" if FLOW_MODE else "SIGNAL"
+
+                # Pretty print
+                print(f"{col}🔥 {label} (score {score}/100) | {symbol} ({name}){RESET}")
+                print(f"{col}   Pair: {pair_addr}{RESET}")
+                print(f"{col}   Age: {age_sec}s{RESET}")
+                print(f"{col}   Liquidity: ${liq:,.0f}{RESET}")
+                print(f"{col}   5m Buys: {buys_5m} vs {sells_5m} sells{RESET}")
+                print(f"{col}   24h Volume: ${vol24:,.0f}{RESET}")
+                print(f"{col}   Tags: {tags_str if tags_str else '(none)'}{RESET}")
+                if axiom_url:
+                    print(f"{col}   Axiom: {axiom_url}{RESET}\n")
+                else:
+                    print()
+
+                # Log signal
+                log_signal([
+                    datetime.utcnow().isoformat(),
+                    pair_addr,
+                    symbol,
+                    name,
+                    age_sec,
+                    liq,
+                    buys_5m,
+                    sells_5m,
+                    vol24,
+                    score,
+                    tags_str,
+                ])
+
+                # Open a new paper trade on this signal
+                maybe_open_paper_trade(p, score, age_sec, tags_str)
+
+            except Exception as e:
+                print("⚠️ Error handling pair:", e)
+
+        # 5) Wait until next cycle
         time.sleep(CHECK_INTERVAL_SECONDS)
-        continue
 
-    # Skip already-seen pairs so we only alert once per pair
-    new_addrs = [a for a in addrs if a not in seen_pairs]
-    for a in new_addrs:
-        seen_pairs.add(a)
 
-    if not new_addrs:
-        time.sleep(CHECK_INTERVAL_SECONDS)
-        continue
-
-    # 3) Fetch full pair data for those new addresses
-    pairs = fetch_pairs_for_addresses(new_addrs)
-
-    # 4) Process each pair
-    for p in pairs:
-        try:
-            # Skip obviously untradable stuff first
-            if not is_probably_tradable_on_axiom(p):
-                continue
-
-            # Structural + behavioural filters
-            if not is_valid_signal(p):
-                continue
-
-            # Compute score
-            score, age_sec, liq, buys_5m, sells_5m = compute_score(p)
-
-            # Allow only good setups (tune 55/60 as you like)
-            if score < 55:
-                continue
-
-            # Smart-money style tags
-            tags, buys_24h, sells_24h, vol24, avg_trade = compute_tags(
-                p, age_sec, liq, buys_5m, sells_5m
-            )
-            tags_str = ", ".join(tags) if tags else ""
-
-            base      = p.get("baseToken", {}) or {}
-            symbol    = base.get("symbol", "UNKNOWN")
-            name      = base.get("name", "")
-            pair_addr = p.get("pairAddress", "unknown")
-            axiom_url = build_axiom_url(p)
-            col       = colour_for_score(score)
-
-            # Pretty print
-            print(f"{col}🔥 SIGNAL (score {score}/100) | {symbol} ({name}){RESET}")
-            print(f"{col}   Pair: {pair_addr}{RESET}")
-            print(f"{col}   Age: {age_sec}s{RESET}")
-            print(f"{col}   Liquidity: ${liq:,.0f}{RESET}")
-            print(f"{col}   5m Buys: {buys_5m} vs {sells_5m} sells{RESET}")
-            print(f"{col}   24h Volume: ${vol24:,.0f}{RESET}")
-            print(f"{col}   Tags: {tags_str if tags_str else '(none)'}{RESET}")
-            if axiom_url:
-                print(f"{col}   Axiom: {axiom_url}{RESET}\n")
-            else:
-                print()
-
-            # Log signal
-            log_signal([
-                datetime.utcnow().isoformat(),
-                pair_addr,
-                symbol,
-                name,
-                age_sec,
-                liq,
-                buys_5m,
-                sells_5m,
-                vol24,
-                score,
-                tags_str,
-            ])
-
-            # Open a new paper trade on this signal
-            maybe_open_paper_trade(p, score, age_sec, tags_str)
-
-        except Exception as e:
-            print("⚠️ Error handling pair:", e)
-
-    # 5) Wait until next cycle
-    time.sleep(CHECK_INTERVAL_SECONDS)
+if __name__ == "__main__":
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down scanner.")
